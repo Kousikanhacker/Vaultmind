@@ -319,19 +319,19 @@ async def upload_document(
     notice_msg = None
 
     # Option A: Connect via Gemma API key
+    target_model_name = model if (model and isinstance(model, str)) else GEMMA_MODEL
     if GEMMA_API_KEY:
-        target_model = model or GEMMA_MODEL
         try:
-            logger.info(f"Analyzing document with Gemma 4 model '{target_model}'...")
-            analysis_result = analyze_with_gemma_api(raw_b64_image, GEMMA_API_KEY, target_model)
-            model_used = f"Gemma 4 ({target_model})"
-            notice_msg = f"Processed successfully via Gemma 4 ({target_model})"
+            logger.info(f"Analyzing document with Gemma 4 model '{target_model_name}'...")
+            analysis_result = analyze_with_gemma_api(raw_b64_image, GEMMA_API_KEY, target_model_name)
+            model_used = f"Gemma 4 ({target_model_name})"
+            notice_msg = f"Processed successfully via Gemma 4 ({target_model_name})"
         except Exception as e:
             logger.warning(f"Gemma API invocation encountered an error: {e}. Attempting Ollama fallback...")
 
     # Option B: Connect via local Ollama
     if not analysis_result:
-        target_ollama_model = model or DEFAULT_OLLAMA_MODEL
+        target_ollama_model = model if (model and isinstance(model, str)) else DEFAULT_OLLAMA_MODEL
         try:
             logger.info(f"Invoking local Ollama model '{target_ollama_model}'...")
             analysis_result = analyze_with_local_ollama(raw_b64_image, target_ollama_model)

@@ -4,7 +4,9 @@ import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-DB_PATH = os.getenv("PAPERTRAIL_DB_PATH", os.path.join(os.path.dirname(__file__), "papertrail.db"))
+# In Vercel serverless environment, only /tmp is writable
+DEFAULT_DB_DIR = "/tmp" if os.getenv("VERCEL") else os.path.dirname(__file__)
+DB_PATH = os.getenv("PAPERTRAIL_DB_PATH", os.path.join(DEFAULT_DB_DIR, "papertrail.db"))
 
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)

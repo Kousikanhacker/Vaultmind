@@ -11,3 +11,4 @@ from backend.main import app
 # Vercel Serverless Function entrypoint
 # The 'app' instance of FastAPI is automatically handled by Vercel's Python runtime
 __all__ = ["app"]
+

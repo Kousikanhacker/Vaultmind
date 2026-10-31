@@ -129,3 +129,4 @@ def delete_document_by_id(doc_id: int, db_path: str = DB_PATH) -> bool:
         cursor.execute("DELETE FROM document_history WHERE id = ?", (doc_id,))
         conn.commit()
         return cursor.rowcount > 0
+

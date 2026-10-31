@@ -56,7 +56,10 @@ export default function App() {
   const [historyList, setHistoryList] = useState([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState(null);
 
-  // Fetch history on load
+  // System health state
+  const [engineInfo, setEngineInfo] = useState({ name: 'gemma-4-26b-a4b-it', connected: true, type: 'Gemma 4' });
+
+  // Fetch history
   const loadHistory = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/history`);
@@ -67,6 +70,20 @@ export default function App() {
     } catch (e) {
       console.warn("Failed to fetch history:", e);
     }
+  }, []);
+
+  // Fetch health and engine status
+  useEffect(() => {
+    fetch(`${API_BASE}/health`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.gemma_api_connected) {
+          setEngineInfo({ name: d.gemma_model || 'gemma-4-26b-a4b-it', connected: true, type: 'Gemma 4' });
+        } else if (d.ollama_connected) {
+          setEngineInfo({ name: 'gemma4:e4b', connected: true, type: 'Local Ollama' });
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -302,8 +319,9 @@ export default function App() {
             </div>
 
             <div className="hidden md:flex items-center space-x-1.5 px-3 py-1.5 rounded-full bg-slate-100 text-slate-700 text-xs border border-slate-200">
-              <Cpu className="w-3.5 h-3.5 text-slate-500" />
-              <span>Engine: <strong className="font-semibold text-slate-900">gemma4:e4b</strong></span>
+              <Cpu className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Engine: <strong className="font-semibold text-slate-900">{engineInfo.name}</strong></span>
+              <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block ml-1"></span>
             </div>
 
             {/* History Button */}
@@ -794,3 +812,4 @@ export default function App() {
     </div>
   );
 }
+

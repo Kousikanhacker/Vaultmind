@@ -3,6 +3,7 @@ import io
 import json
 import base64
 import logging
+import urllib.request
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,10 @@ from pydantic import BaseModel, Field
 import pdfplumber
 from PIL import Image
 import ollama
+from dotenv import load_dotenv
+
+# Load local environment variables from .env
+load_dotenv()
 
 try:
     from backend.database import (
@@ -31,7 +36,11 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("papertrail")
 
-# Exact model name specified by user
+# Gemma API Configuration
+GEMMA_API_KEY = os.getenv("GEMMA_API_KEY", "").strip()
+GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma-4-26b-a4b-it").strip()
+
+# Local Ollama model fallback configuration
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
 
 # Exact system prompt mandated in mission instructions
@@ -68,8 +77,8 @@ class DocumentAnalysis(BaseModel):
     )
 
 app = FastAPI(
-    title="PaperTrail / VaultMind - Privacy-First Document Analyzer",
-    description="100% offline, privacy-first legal & financial document analyzer powered by FastAPI, SQLite, and local Ollama.",
+    title="PaperTrail / VaultMind - Document Risk Analyzer",
+    description="Privacy-first legal & financial document analyzer powered by FastAPI, SQLite, Gemma 4, and local Ollama.",
     version="1.0.0"
 )
 
@@ -86,6 +95,10 @@ app.add_middleware(
 def on_startup():
     init_db()
     logger.info("Local SQLite database initialized.")
+    if GEMMA_API_KEY:
+        logger.info(f"Gemma API key detected. Primary model: {GEMMA_MODEL}")
+    else:
+        logger.info(f"Gemma API key not set. Using local Ollama model: {DEFAULT_OLLAMA_MODEL}")
 
 def extract_image_base64_from_upload(file_bytes: bytes, filename: str, content_type: Optional[str]) -> str:
     """
@@ -118,7 +131,6 @@ def extract_image_base64_from_upload(file_bytes: bytes, filename: str, content_t
         # Standard image (PNG, JPG, JPEG, WEBP, TIFF)
         try:
             image = Image.open(io.BytesIO(file_bytes))
-            # Convert to RGB if needed (e.g. RGBA or palette)
             if image.mode in ("RGBA", "P"):
                 image = image.convert("RGB")
             buf = io.BytesIO()
@@ -136,6 +148,11 @@ def parse_analysis_json(raw_text: str) -> DocumentAnalysis:
         cleaned = cleaned.split("```json")[1].split("```")[0].strip()
     elif "```" in cleaned:
         cleaned = cleaned.split("```")[1].split("```")[0].strip()
+    else:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end+1].strip()
     
     try:
         return DocumentAnalysis.model_validate_json(cleaned)
@@ -148,15 +165,97 @@ def parse_analysis_json(raw_text: str) -> DocumentAnalysis:
             logger.error(f"Failed to parse model response into DocumentAnalysis: {parse_err}")
             raise
 
+def analyze_with_gemma_api(raw_b64_image: str, api_key: str = GEMMA_API_KEY, model_name: str = GEMMA_MODEL) -> DocumentAnalysis:
+    """
+    Calls Google Generative Language API using the user's Gemma API key and model.
+    Passes the base64 image with the exact legal/financial risk system prompt and enforces JSON schema.
+    """
+    clean_model = model_name.replace("models/", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
+    
+    prompt_text = (
+        "Extract parties, financial amounts, deadlines, and risky clauses from this document image. "
+        "Strictly output a valid JSON object matching this schema:\n"
+        "{\n"
+        '  "parties": ["string"],\n'
+        '  "total_amount": "string",\n'
+        '  "deadlines": ["string"],\n'
+        '  "risky_clauses": [\n'
+        '    {\n'
+        '      "clause": "string",\n'
+        '      "risk_level": "High/Critical/Medium/Low",\n'
+        '      "explanation": "Simple English explanation of why it is risky"\n'
+        '    }\n'
+        '  ]\n'
+        "}\n"
+        "Do not include any text outside the JSON code block."
+    )
+    
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt_text},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": raw_b64_image
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.2
+        }
+    }
+    
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "PaperTrail-Gemma/1.0"}
+    )
+    
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+        raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+        logger.info(f"Gemma API response received: {raw_text[:200]}...")
+        return parse_analysis_json(raw_text)
+
+def analyze_with_local_ollama(raw_b64_image: str, target_model: str) -> DocumentAnalysis:
+    """Invokes official ollama-python chat API with image and structured schema."""
+    response = ollama.chat(
+        model=target_model,
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Analyze this document image. Return valid JSON strictly matching the schema: "
+                    "parties (list of strings), total_amount (string), deadlines (list of strings), "
+                    "and risky_clauses (list of objects with clause, risk_level, and explanation)."
+                ),
+                "images": [raw_b64_image]
+            }
+        ],
+        format=DocumentAnalysis.model_json_schema()
+    )
+    content = response.message.content
+    logger.info(f"Ollama raw response received: {content[:200]}...")
+    return parse_analysis_json(content)
+
 def generate_fallback_analysis_for_offline_demo(filename: str, pdf_text: Optional[str] = None) -> DocumentAnalysis:
     """
-    Intelligent offline fallback analysis when Ollama daemon or the specific model
-    has not completed downloading/pulling locally yet. Ensures the user always sees
-    meaningful offline analysis while providing instructions on running 'ollama pull gemma4:e4b'.
+    Intelligent offline fallback analysis when neither Gemma API nor local Ollama
+    is reachable. Ensures the user always sees meaningful analysis while providing setup guidance.
     """
-    text_content = pdf_text or ""
-    lower = text_content.lower()
-
     parties = ["Acme Holdings LLC", "Prime Tenant Corp"]
     total_amount = "$4,250.00 / month (plus $8,500 security deposit)"
     deadlines = [
@@ -191,13 +290,13 @@ def generate_fallback_analysis_for_offline_demo(filename: str, pdf_text: Optiona
 @app.post("/api/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    model: Optional[str] = Query(None, description="Optional override for Ollama model name")
+    model: Optional[str] = Query(None, description="Optional override for model name")
 ):
     """
     POST /api/upload
     Accepts an uploaded image or PDF.
     If PDF: uses pdfplumber to extract the first page and convert it to a base64 image string.
-    Passes base64 image to local Ollama model (gemma4:e4b) using the exact specified system prompt.
+    Passes base64 image to Gemma 4 (via configured API key or local Ollama) using the exact specified system prompt.
     Forces output into strict Pydantic JSON schema and saves history in SQLite.
     """
     if not file.filename:
@@ -214,58 +313,45 @@ async def upload_document(
     raw_b64_image = extract_image_base64_from_upload(file_bytes, file.filename, file.content_type)
     preview_data_url = f"data:image/png;base64,{raw_b64_image}"
 
-    # Step 2: Query local Ollama model
-    target_model = model or DEFAULT_OLLAMA_MODEL
+    # Step 2: Query Model (Gemma API if configured, otherwise local Ollama)
     analysis_result: Optional[DocumentAnalysis] = None
-    ollama_error_msg: Optional[str] = None
+    model_used = None
+    notice_msg = None
 
-    try:
-        logger.info(f"Invoking local Ollama model '{target_model}'...")
-        # Official ollama-python chat API with image and structured schema format
-        response = ollama.chat(
-            model=target_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Analyze this document image. Return valid JSON strictly matching the schema: "
-                        "parties (list of strings), total_amount (string), deadlines (list of strings), "
-                        "and risky_clauses (list of objects with clause, risk_level, and explanation)."
-                    ),
-                    "images": [raw_b64_image]
-                }
-            ],
-            format=DocumentAnalysis.model_json_schema()
-        )
+    # Option A: Connect via Gemma API key
+    if GEMMA_API_KEY:
+        target_model = model or GEMMA_MODEL
+        try:
+            logger.info(f"Analyzing document with Gemma 4 model '{target_model}'...")
+            analysis_result = analyze_with_gemma_api(raw_b64_image, GEMMA_API_KEY, target_model)
+            model_used = f"Gemma 4 ({target_model})"
+            notice_msg = f"Processed successfully via Gemma 4 ({target_model})"
+        except Exception as e:
+            logger.warning(f"Gemma API invocation encountered an error: {e}. Attempting Ollama fallback...")
 
-        content = response.message.content
-        logger.info(f"Ollama raw response received: {content[:200]}...")
-        analysis_result = parse_analysis_json(content)
-
-    except Exception as e:
-        ollama_error_msg = str(e)
-        logger.warning(
-            f"Ollama invocation for '{target_model}' encountered an issue: {e}. "
-            "Engaging offline heuristic parser to preserve user workflow."
-        )
-
-        # Attempt to extract text from PDF if possible
-        extracted_text = ""
-        if file.filename.lower().endswith(".pdf"):
-            try:
-                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                    for page in pdf.pages[:3]:
-                        text = page.extract_text()
-                        if text:
-                            extracted_text += text + "\n"
-            except Exception:
-                pass
-
-        analysis_result = generate_fallback_analysis_for_offline_demo(file.filename, extracted_text)
+    # Option B: Connect via local Ollama
+    if not analysis_result:
+        target_ollama_model = model or DEFAULT_OLLAMA_MODEL
+        try:
+            logger.info(f"Invoking local Ollama model '{target_ollama_model}'...")
+            analysis_result = analyze_with_local_ollama(raw_b64_image, target_ollama_model)
+            model_used = f"Ollama ({target_ollama_model})"
+            notice_msg = f"Processed locally via Ollama ({target_ollama_model})"
+        except Exception as e:
+            logger.warning(f"Local Ollama invocation error: {e}. Engaging offline heuristic fallback.")
+            extracted_text = ""
+            if file.filename.lower().endswith(".pdf"):
+                try:
+                    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                        for page in pdf.pages[:3]:
+                            text = page.extract_text()
+                            if text:
+                                extracted_text += text + "\n"
+                except Exception:
+                    pass
+            analysis_result = generate_fallback_analysis_for_offline_demo(file.filename, extracted_text)
+            model_used = "Offline Heuristic Fallback"
+            notice_msg = f"Model execution note: {e}"
 
     # Step 3: Save analysis and preview in local SQLite database
     doc_id = save_document_analysis(
@@ -280,11 +366,8 @@ async def upload_document(
         "id": doc_id,
         "filename": file.filename,
         "preview_image": preview_data_url,
-        "model_used": target_model,
-        "offline_notice": (
-            f"Ollama offline notice: {ollama_error_msg} (Ensure Ollama is running and 'ollama pull {target_model}' has finished)"
-            if ollama_error_msg else "Processed 100% offline via local Ollama"
-        ),
+        "model_used": model_used,
+        "offline_notice": notice_msg,
         "analysis": analysis_result.model_dump()
     }
 
@@ -311,7 +394,7 @@ def delete_document(doc_id: int):
 
 @app.get("/api/health")
 def health_check():
-    """System health check verifying database and local Ollama status."""
+    """System health check verifying database and Gemma / Ollama connectivity."""
     ollama_ok = False
     available_models = []
     try:
@@ -328,9 +411,9 @@ def health_check():
     return {
         "status": "healthy",
         "app": "PaperTrail / VaultMind",
-        "offline_mode": True,
-        "target_model": DEFAULT_OLLAMA_MODEL,
+        "gemma_api_connected": bool(GEMMA_API_KEY),
+        "gemma_model": GEMMA_MODEL if GEMMA_API_KEY else None,
         "ollama_connected": ollama_ok,
-        "available_models": available_models,
+        "ollama_models": available_models,
         "database": "SQLite (local)"
     }
